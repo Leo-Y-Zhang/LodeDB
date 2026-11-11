@@ -14,6 +14,12 @@
 //!
 //! `run.sh` builds this probe against the working tree and against a base git
 //! revision and runs both over the same stores. macOS and Linux.
+//!
+//! For `run.sh --components` there are three opt-in flags, all off by default:
+//! `--residency` adds a JSON row per stage with `/proc/self/smaps_rollup`
+//! figures (Linux), `--control` reports the stages without opening a store, and
+//! `--components` (only in a `--features components` build) replaces each
+//! stage's line with live heap bytes by component (see `components.rs`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +29,10 @@ use lodedb_core::engine::CoreEngine;
 use lodedb_core::types::CoreOpenOptions;
 use serde_json::json;
 
+#[cfg(feature = "components")]
+mod components;
+mod residency;
+
 struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -31,30 +41,55 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
+        #[cfg(feature = "components")]
+        if components::internal() {
+            return ptr;
+        }
         if !ptr.is_null() {
             grow(layout.size());
+            #[cfg(feature = "components")]
+            components::allocated(ptr, layout.size());
         }
         ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc_zeroed(layout);
+        #[cfg(feature = "components")]
+        if components::internal() {
+            return ptr;
+        }
         if !ptr.is_null() {
             grow(layout.size());
+            #[cfg(feature = "components")]
+            components::allocated(ptr, layout.size());
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(feature = "components")]
+        if components::internal() {
+            System.dealloc(ptr, layout);
+            return;
+        }
+        #[cfg(feature = "components")]
+        components::freed(ptr, layout.size());
         System.dealloc(ptr, layout);
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new = System.realloc(ptr, layout, new_size);
+        #[cfg(feature = "components")]
+        if components::internal() {
+            return new;
+        }
         if !new.is_null() {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             grow(new_size);
+            #[cfg(feature = "components")]
+            components::resized(ptr, new, layout.size(), new_size);
         }
         new
     }
@@ -115,12 +150,18 @@ struct Probe {
 impl Probe {
     fn start() -> Self {
         PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+        #[cfg(feature = "components")]
+        components::start_stage();
         Self {
             started: Instant::now(),
         }
     }
 
     fn report(self, stage: &str) {
+        #[cfg(feature = "components")]
+        if components::report(stage) {
+            return;
+        }
         let elapsed = self.started.elapsed();
         let (now, peak) = footprint();
         println!(
@@ -131,10 +172,17 @@ impl Probe {
             mib(LIVE.load(Ordering::Relaxed) as u64),
             mib(PEAK.load(Ordering::Relaxed) as u64),
         );
+        if residency::ENABLED.load(Ordering::Relaxed) {
+            residency::report(stage);
+        }
     }
 }
 
 fn main() {
+    #[cfg(feature = "components")]
+    if std::env::args().any(|arg| arg == "--components") {
+        components::enable();
+    }
     let mut args = std::env::args().skip(1);
     let mut store = None;
     let mut refresh = true;
@@ -142,8 +190,18 @@ fn main() {
     let mut filter = false;
     let mut top_k = 60usize;
     let mut hold_secs = 0u64;
+    let mut control = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--components" => {
+                #[cfg(not(feature = "components"))]
+                {
+                    eprintln!("--components requires a build with --features components");
+                    std::process::exit(2);
+                }
+            }
+            "--residency" => residency::ENABLED.store(true, Ordering::Relaxed),
+            "--control" => control = true,
             "--no-refresh" => refresh = false,
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--filter" => filter = true,
@@ -163,8 +221,17 @@ fn main() {
             other => panic!("unexpected argument {other}"),
         }
     }
+    if control {
+        Probe::start().report("idle");
+        Probe::start().report("open");
+        Probe::start().report("search1");
+        Probe::start().report("search2");
+        let probe = Probe::start();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        probe.report("settled");
+        return;
+    }
     let store = store.expect("usage: embedded-open-memory <store-dir> [options]");
-
     Probe::start().report("idle");
 
     let probe = Probe::start();

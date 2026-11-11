@@ -5,6 +5,9 @@
 # return identical results (read-only, and after a writable open on a copy).
 #
 #   benchmarks/embedded_open_memory/run.sh [--base <rev> | --probe-dir <dir>] [--runs N] <store-dir>...
+#   benchmarks/embedded_open_memory/run.sh --components [--runs N] <store-dir>...
+#
+# --components prints where the heap goes by component (see README.md).
 #
 # Stores are never modified; the writable check runs on copies. macOS and Linux.
 set -euo pipefail
@@ -14,16 +17,25 @@ repo=$(cd "$here/../.." && pwd)
 base=""
 probe_dir=""
 runs=1
+components=false
 stores=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --components) components=true; shift ;;
     --base) base=$2; shift 2 ;;
     --probe-dir) probe_dir=$2; shift 2 ;;
     --runs) runs=$2; shift 2 ;;
     *) stores+=("$1"); shift ;;
   esac
 done
-[ ${#stores[@]} -gt 0 ] || { echo "usage: $0 [--base <rev> | --probe-dir <dir>] [--runs N] <store-dir>..." >&2; exit 2; }
+if $components; then
+  [ -z "$base" ] && [ -z "$probe_dir" ] || {
+    echo "--components cannot be combined with --base or --probe-dir; attribution uses separate builds" >&2
+    exit 2
+  }
+  [[ "$runs" =~ ^[1-9][0-9]*$ ]] || { echo "--runs needs a positive integer" >&2; exit 2; }
+fi
+[ ${#stores[@]} -gt 0 ] || { echo "usage: $0 [--components | --base <rev> | --probe-dir <dir>] [--runs N] <store-dir>..." >&2; exit 2; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -32,6 +44,22 @@ build() { # <source-root> <target-dir>
   cargo build --release --quiet --jobs "${JOBS:-4}" \
     --manifest-path "$1/benchmarks/embedded_open_memory/Cargo.toml" --target-dir "$2"
 }
+
+if $components; then
+  # One target directory serves both feature sets; the plain build runs last so
+  # the usual head binary stays uninstrumented.
+  mkdir -p "$work/attributed"
+  cargo build --release --quiet --jobs "${JOBS:-4}" --features components \
+    --bin embedded-open-memory --manifest-path "$here/Cargo.toml" \
+    --target-dir "$repo/target/embedded-open-memory/head"
+  cp "$repo/target/embedded-open-memory/head/release/embedded-open-memory" "$work/attributed/"
+  build "$repo" "$repo/target/embedded-open-memory/head"
+  python3 "$here/report.py" --runs "$runs" \
+    --clean "$repo/target/embedded-open-memory/head/release/embedded-open-memory" \
+    --attributed "$work/attributed/embedded-open-memory" \
+    "${stores[@]}"
+  exit 0
+fi
 
 builds=(head)
 if [ -n "$probe_dir" ]; then
