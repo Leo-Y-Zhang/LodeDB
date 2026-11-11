@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the full parsed token tree. Readers retain only the MaxScore serving snapshot
   and its id mappings; writable handles keep incremental BM25 updates. A WAL
   refresh invalidates the reader's snapshot before replay.
+- A read-only open no longer keeps the `.tvlex` text in memory. It checks the
+  base and delta segments as before, then holds the files open (at most one
+  descriptor for the base plus the 64-segment journal limit) and reads them
+  again, re-checking their SHA-256, only when it builds BM25 or returns token
+  lists. A reader that only runs vector search never reads the text into
+  memory, and a reader opened before a writer collects the epoch still works.
 
 ## [2.3.1] - 2026-10-18
 

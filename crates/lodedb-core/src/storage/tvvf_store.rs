@@ -1625,13 +1625,13 @@ fn invalid(message: impl Into<String>) -> TvvfError {
 }
 
 #[cfg(unix)]
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(bytes, offset)
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut read = 0;
     while read < bytes.len() {
@@ -1648,7 +1648,7 @@ fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     let mut copy = file.try_clone()?;
     copy.seek(SeekFrom::Start(offset))?;
     copy.read_exact(bytes)

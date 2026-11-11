@@ -57,7 +57,7 @@ pub struct LoadedStore {
     pub raw_text: BTreeMap<String, String>,
     pub lexical_tokens: BTreeMap<String, TokenLists>,
     /// Set instead of `lexical_tokens` by [`load_store_deferring_lexical`]: the
-    /// checked `.tvlex` text, left for the reader to parse when it needs it.
+    /// checked `.tvlex` files, held open for the reader to parse when it needs them.
     pub lexical_bytes: Option<lexical_store::LexicalBytes>,
     pub multivec: MultiVecMap,
     /// The persisted ANN cluster partition, if a valid `.tvann` sidecar was
@@ -111,8 +111,8 @@ pub fn load_store(
     load_store_impl(persistence_dir.as_ref(), index_key, options, false)
 }
 
-/// [`load_store`] that reads and checks the committed `.tvlex` but leaves it
-/// unparsed in [`LoadedStore::lexical_bytes`], with `lexical_tokens` empty.
+/// [`load_store`] that checks the committed `.tvlex` and holds its files open,
+/// unparsed, in [`LoadedStore::lexical_bytes`], with `lexical_tokens` empty.
 pub fn load_store_deferring_lexical(
     persistence_dir: impl AsRef<Path>,
     index_key: &str,
@@ -217,10 +217,15 @@ fn load_generation_store_impl(
         None => BTreeMap::new(),
     };
     let lexical_bytes = match manifest.store_manifest("tvlex") {
-        Some(tvlex_manifest) => lexical_store::read_bytes(
-            &base_tvlex_path(persistence_dir, &index_key, base_epoch),
-            Some(tvlex_manifest),
-        )?,
+        Some(tvlex_manifest) => {
+            let base_path = base_tvlex_path(persistence_dir, &index_key, base_epoch);
+            // A deferred open keeps the files open rather than their text.
+            if defer_lexical {
+                lexical_store::open_held(&base_path, Some(tvlex_manifest))?
+            } else {
+                lexical_store::read_bytes(&base_path, Some(tvlex_manifest))?
+            }
+        }
         None => None,
     };
     let (lexical_tokens, lexical_bytes) = match lexical_bytes {

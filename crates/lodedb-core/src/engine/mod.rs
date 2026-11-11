@@ -8821,4 +8821,144 @@ mod lazy_index_tests {
         fs::remove_dir_all(eager_dir).unwrap();
         fs::remove_dir_all(lazy_dir).unwrap();
     }
+
+    /// `seed`, then an upsert and a delete committed on top, so the lexical
+    /// store has a base and at least one delta segment.
+    fn seed_with_delta(dir: &Path) {
+        seed(dir);
+        let mut writer = CoreEngine::open(options(dir, false)).unwrap();
+        writer
+            .upsert_vectors(
+                "default",
+                &[document(
+                    "doc-90",
+                    3,
+                    "fact",
+                    Some("Lisbon ferry timetable"),
+                )],
+            )
+            .unwrap();
+        writer
+            .delete_documents("default", &["doc-01".to_string()])
+            .unwrap();
+        writer.persist().unwrap();
+    }
+
+    /// Text bytes the reader keeps in memory for its lexical store, and files
+    /// it keeps open.
+    fn lexical_residency(engine: &CoreEngine) -> (usize, usize) {
+        index(engine)
+            .deferred_token_lists
+            .as_ref()
+            .and_then(|deferred| deferred.bytes.as_ref())
+            .expect("deferred lexical store")
+            .residency()
+    }
+
+    fn lexical_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.ends_with(".tvlex") || name.ends_with(".tvlex-delta") {
+                out.push(path);
+            } else if path.is_dir() {
+                lexical_files(&path, out);
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_open_holds_lexical_files_not_text() {
+        let dir = temp_dir("held-files");
+        seed_with_delta(&dir);
+        let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let (text, files) = lexical_residency(&reader);
+        assert_eq!(text, 0);
+        assert!(files >= 2, "base and a delta segment, got {files}");
+
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert_eq!(queries(&reader), queries(&eager));
+        // The BM25 index is built; the reader still holds no text.
+        assert!(index(&reader).lexical_index.get().is_some());
+        assert_eq!(lexical_residency(&reader), (0, files));
+        for _ in 0..2 {
+            assert_eq!(
+                reader.document_token_lists("default").unwrap(),
+                eager.document_token_lists("default").unwrap()
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A regression guard for the reason the files are held rather than their
+    /// paths: it also passes when the text itself is held.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_reader_keeps_its_lexical_store_after_the_files_are_removed() {
+        let dir = temp_dir("collected");
+        seed_with_delta(&dir);
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        let expected = (
+            queries(&eager),
+            eager.document_token_lists("default").unwrap(),
+        );
+        drop(eager);
+        let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let mut removed = Vec::new();
+        lexical_files(&dir, &mut removed);
+        assert!(removed.len() >= 2, "{removed:?}");
+        for path in &removed {
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert_eq!(
+            (
+                queries(&reader),
+                reader.document_token_lists("default").unwrap()
+            ),
+            expected
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_lexical_query_fails_closed_when_the_text_changes_after_open() {
+        use crate::error::CoreErrorCode;
+        let dir = temp_dir("tamper");
+        seed(&dir);
+        let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let mut found = Vec::new();
+        lexical_files(&dir, &mut found);
+        let base = found
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("lexical base");
+        let original = fs::read(&base).unwrap();
+        let mut tampered = original.clone();
+        let at = tampered
+            .iter()
+            .rposition(u8::is_ascii_lowercase)
+            .expect("a letter to change");
+        tampered[at] = if tampered[at] == b'z' {
+            b'y'
+        } else {
+            tampered[at] + 1
+        };
+        fs::write(&base, &tampered).unwrap();
+
+        let mut query = vec![0.1; 8];
+        query[2] = 1.0;
+        let plan = reader.prepare_query_text("Lisbon trip", "lexical").unwrap();
+        let lexical = || reader.search_embedded_text("default", &plan, Some(&query), 5, None);
+        assert_eq!(lexical().unwrap_err().code(), CoreErrorCode::CorruptStore);
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(reader.query_vector("default", &query, 5, None).is_ok());
+        // Nothing was cached, so once the bytes are back a retry succeeds.
+        fs::write(&base, &original).unwrap();
+        assert!(lexical().is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

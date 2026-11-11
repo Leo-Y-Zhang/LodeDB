@@ -1,14 +1,25 @@
+use crate::storage::tvvf_store::read_exact_at;
 use crate::storage::util::{
     body_sha256, checksummed_body_from_text, checksummed_body_payload, corrupt, get_i64, get_str,
-    parse_json, read_json, read_text, sha256_file_hex, sidecar_base_block,
+    parse_json, read_json, read_text, sha256_bytes_hex, sha256_file_hex, sidecar_base_block,
     validate_sidecar_manifest, value_object, write_pretty_json_atomic, write_py_json, CoreResult,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const LEXICAL_INDEX_DELTA_DIR_SUFFIX: &str = ".tvlex-delta";
+
+/// Delta segments [`open_held`] keeps open. Writers fold the journal before it
+/// passes this many segments (`MAX_GENERATION_DELTA_SEGMENTS`), so a committed
+/// store holds at most one descriptor for the base plus this many; segments
+/// past it (a store outside that bound) keep their text in memory, as before.
+const HELD_SEGMENT_LIMIT: usize = 64;
 pub const LEXICAL_INDEX_MANIFEST_NAME: &str = "manifest.json";
 pub const LEXICAL_INDEX_SCHEMA_VERSION: i64 = 1;
 
@@ -34,20 +45,52 @@ pub fn load(
     }
 }
 
-/// The text of a committed lexical store, base and delta segments, read and
-/// checked against the commit manifest but not parsed. A read-only open keeps
-/// this instead of the token lists (a fraction of their in-memory size) and
-/// parses it the first time something needs the tokens; holding the text
-/// rather than the paths keeps that working after a writer collects the epoch.
+/// A committed lexical store, base and delta segments, checked against the
+/// commit manifest but not parsed. A read-only open keeps this instead of the
+/// token lists and parses it the first time something needs the tokens. From
+/// [`open_held`] it holds open files rather than their text, so a handle that
+/// never runs a lexical query never reads the text into memory; holding files
+/// rather than paths keeps the parse working after a writer collects the epoch.
 #[derive(Debug, Clone)]
 pub struct LexicalBytes {
-    base: String,
-    segments: Vec<String>,
+    base: LexicalSource,
+    segments: Vec<LexicalSource>,
+}
+
+/// One committed file: its text, or an open handle with the length and
+/// SHA-256 its contents had when the store was opened.
+#[derive(Debug, Clone)]
+enum LexicalSource {
+    Text(String),
+    Held {
+        file: Arc<File>,
+        len: u64,
+        sha256: String,
+        context: &'static str,
+    },
 }
 
 /// Reads what [`load`] parses, with the same manifest, ordering and segment
 /// checksum checks. `None` when the base file is absent.
 pub fn read_bytes(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Option<LexicalBytes>> {
+    read_sources(base_path, manifest, 0)
+}
+
+/// [`read_bytes`] with the same checks (including that each file is UTF-8),
+/// keeping the base and up to [`HELD_SEGMENT_LIMIT`] segments as open files
+/// instead of text. The text is read again, and must hash the same, each time
+/// the store is parsed.
+pub fn open_held(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Option<LexicalBytes>> {
+    read_sources(base_path, manifest, HELD_SEGMENT_LIMIT)
+}
+
+/// `held_segments == 0` reads everything as text; otherwise the base and the
+/// first `held_segments` segments are held open.
+fn read_sources(
+    base_path: &Path,
+    manifest: Option<&Value>,
+    held_segments: usize,
+) -> CoreResult<Option<LexicalBytes>> {
     if !base_path.is_file() {
         return Ok(None);
     }
@@ -59,7 +102,22 @@ pub fn read_bytes(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Opti
             "lexical index",
         )?;
     }
-    let base = read_text(base_path, "lexical index base")?;
+    let base = if held_segments == 0 {
+        LexicalSource::Text(read_text(base_path, "lexical index base")?)
+    } else {
+        let base = LexicalSource::hold(base_path, "lexical index base")?;
+        // The manifest check above read the path; the retained handle must
+        // hold those same bytes.
+        let expected = manifest
+            .and_then(|manifest| manifest.get("base"))
+            .and_then(Value::as_object)
+            .map(|base| get_str(base, "sha256"))
+            .unwrap_or_default();
+        if !expected.is_empty() && base.held_sha256() != Some(expected) {
+            return Err(corrupt("lexical index base failed manifest checksum"));
+        }
+        base
+    };
     let mut segments = Vec::new();
     if let Some(manifest) = manifest {
         let manifest = value_object(manifest, "lexical index manifest")?;
@@ -88,15 +146,109 @@ pub fn read_bytes(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Opti
                     "lexical index segment is missing: {file_name}"
                 )));
             }
-            if sha256_file_hex(&path)? != get_str(entry, "sha256") {
-                return Err(corrupt(format!(
+            let checksum_failed = || {
+                corrupt(format!(
                     "lexical index segment failed checksum: {file_name}"
-                )));
+                ))
+            };
+            if segments.len() < held_segments {
+                let segment = LexicalSource::hold(&path, "lexical index segment")?;
+                if segment.held_sha256() != Some(get_str(entry, "sha256")) {
+                    return Err(checksum_failed());
+                }
+                segments.push(segment);
+                continue;
             }
-            segments.push(read_text(&path, "lexical index segment")?);
+            if sha256_file_hex(&path)? != get_str(entry, "sha256") {
+                return Err(checksum_failed());
+            }
+            segments.push(LexicalSource::Text(read_text(
+                &path,
+                "lexical index segment",
+            )?));
         }
     }
     Ok(Some(LexicalBytes { base, segments }))
+}
+
+impl LexicalSource {
+    /// Opens `path` and streams it once to record its length and SHA-256 and
+    /// to check it is UTF-8, keeping only the handle.
+    fn hold(path: &Path, context: &'static str) -> CoreResult<Self> {
+        let read_error = |error: std::io::Error| {
+            corrupt(format!("{} could not be read: {error}", path.display()))
+        };
+        let mut file = File::open(path).map_err(read_error)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut len = 0_u64;
+        // The bytes not yet checked as UTF-8: the latest read, after at most
+        // three bytes of a sequence split across the previous read.
+        let mut pending = Vec::new();
+        loop {
+            let read = file.read(&mut buffer).map_err(read_error)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            len += read as u64;
+            pending.extend_from_slice(&buffer[..read]);
+            match std::str::from_utf8(&pending) {
+                Ok(_) => pending.clear(),
+                Err(error) if error.error_len().is_none() => {
+                    pending.drain(..error.valid_up_to());
+                }
+                Err(_) => return Err(not_utf8(context)),
+            }
+        }
+        if !pending.is_empty() {
+            return Err(not_utf8(context));
+        }
+        Ok(Self::Held {
+            file: Arc::new(file),
+            len,
+            sha256: format!("{:x}", digest.finalize()),
+            context,
+        })
+    }
+
+    fn held_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Text(_) => None,
+            Self::Held { sha256, .. } => Some(sha256),
+        }
+    }
+
+    /// The text, read again from a held file. Fails closed, returning no
+    /// text, if the file no longer holds the bytes it had at open.
+    fn text(&self) -> CoreResult<Cow<'_, str>> {
+        let (file, len, sha256, context) = match self {
+            Self::Text(text) => return Ok(Cow::Borrowed(text)),
+            Self::Held {
+                file,
+                len,
+                sha256,
+                context,
+            } => (file, *len, sha256, *context),
+        };
+        let size =
+            usize::try_from(len).map_err(|_| corrupt(format!("{context} is too large to read")))?;
+        let mut bytes = vec![0_u8; size];
+        read_exact_at(file, &mut bytes, 0)
+            .map_err(|error| corrupt(format!("{context} could not be read: {error}")))?;
+        if sha256_bytes_hex(&bytes) != *sha256 {
+            return Err(corrupt(format!("{context} changed after it was opened")));
+        }
+        String::from_utf8(bytes)
+            .map(Cow::Owned)
+            .map_err(|_| not_utf8(context))
+    }
+}
+
+fn not_utf8(context: &str) -> crate::error::CoreError {
+    corrupt(format!(
+        "{context} could not be read: stream did not contain valid UTF-8"
+    ))
 }
 
 impl LexicalBytes {
@@ -108,8 +260,14 @@ impl LexicalBytes {
         &self,
         mut visit: impl FnMut(&str, TokenLists),
     ) -> CoreResult<()> {
-        let mut frames = vec![DocumentFrame::parse(&self.base, "documents", false)?];
-        for segment in &self.segments {
+        let base = self.base.text()?;
+        let segments = self
+            .segments
+            .iter()
+            .map(LexicalSource::text)
+            .collect::<CoreResult<Vec<_>>>()?;
+        let mut frames = vec![DocumentFrame::parse(&base, "documents", false)?];
+        for segment in &segments {
             frames.push(DocumentFrame::parse(segment, "upserted", true)?);
         }
         let mut effective = BTreeMap::new();
@@ -129,9 +287,9 @@ impl LexicalBytes {
 
     /// Parses the base and replays the segments in manifest order.
     pub fn parse(&self) -> CoreResult<BTreeMap<String, TokenLists>> {
-        let mut documents = parse_base(&self.base)?;
+        let mut documents = parse_base(&self.base.text()?)?;
         for segment in &self.segments {
-            let body = segment_body(segment)?;
+            let body = segment_body(&segment.text()?)?;
             for deleted in body
                 .get("deleted")
                 .and_then(Value::as_array)
@@ -411,6 +569,28 @@ fn normalize_token_lists(value: &Value) -> CoreResult<TokenLists> {
 }
 
 #[cfg(test)]
+impl LexicalBytes {
+    pub(crate) fn from_text(base: String, segments: Vec<String>) -> Self {
+        Self {
+            base: LexicalSource::Text(base),
+            segments: segments.into_iter().map(LexicalSource::Text).collect(),
+        }
+    }
+
+    /// Text bytes kept in memory, and files kept open.
+    pub(crate) fn residency(&self) -> (usize, usize) {
+        let (mut text, mut files) = (0, 0);
+        for source in std::iter::once(&self.base).chain(&self.segments) {
+            match source {
+                LexicalSource::Text(bytes) => text += bytes.len(),
+                LexicalSource::Held { .. } => files += 1,
+            }
+        }
+        (text, files)
+    }
+}
+
+#[cfg(test)]
 mod streaming_tests {
     use super::*;
     use crate::storage::util::{checksummed_body_payload, py_canonical_json};
@@ -424,17 +604,16 @@ mod streaming_tests {
 
     #[test]
     fn document_visitor_matches_eager_parse_with_deltas_and_escapes() {
-        let lexical = LexicalBytes {
-            base: bytes(json!({"schema_version": 1, "documents": {
-                "z": [["old"]], "a\\\"é": [["café", "😀", "", 9]], "empty": [], "chunks": [[], ["alpha"]]
-            }})),
-            segments: vec![
-                bytes(
-                    json!({"schema_version": 1, "deleted": ["z", "missing"], "upserted": {"chunks": [["new"]], "z": [["restored"]]}}),
-                ),
-                bytes(json!({"schema_version": 1, "deleted": ["z"], "upserted": {"final": [[]]}})),
-            ],
-        };
+        let base = bytes(json!({"schema_version": 1, "documents": {
+            "z": [["old"]], "a\\\"é": [["café", "😀", "", 9]], "empty": [], "chunks": [[], ["alpha"]]
+        }}));
+        let segments = vec![
+            bytes(
+                json!({"schema_version": 1, "deleted": ["z", "missing"], "upserted": {"chunks": [["new"]], "z": [["restored"]]}}),
+            ),
+            bytes(json!({"schema_version": 1, "deleted": ["z"], "upserted": {"final": [[]]}})),
+        ];
+        let lexical = LexicalBytes::from_text(base.clone(), segments.clone());
         let mut visited = BTreeMap::new();
         lexical
             .visit_documents(|id, lists| {
@@ -443,11 +622,10 @@ mod streaming_tests {
             .unwrap();
         assert_eq!(visited, lexical.parse().unwrap());
         // Also accept compact canonical input, not just pretty JSON.
-        let lexical = LexicalBytes {
-            base: py_canonical_json(&serde_json::from_str::<Value>(&lexical.base).unwrap())
-                .unwrap(),
-            segments: lexical.segments,
-        };
+        let lexical = LexicalBytes::from_text(
+            py_canonical_json(&serde_json::from_str::<Value>(&base).unwrap()).unwrap(),
+            segments,
+        );
         let mut canonical = BTreeMap::new();
         lexical
             .visit_documents(|id, lists| {
@@ -469,22 +647,167 @@ mod streaming_tests {
             bad_documents,
             bad_schema,
         ] {
-            let lexical = LexicalBytes {
+            let lexical = LexicalBytes::from_text(
                 base,
-                segments: vec![bytes(
+                vec![bytes(
                     json!({"schema_version": 1, "deleted": ["d"], "upserted": {}}),
                 )],
-            };
+            );
             assert!(lexical.parse().is_err());
             assert!(lexical.visit_documents(|_, _| {}).is_err());
         }
-        let lexical = LexicalBytes {
-            base: good,
-            segments: vec![
+        let lexical = LexicalBytes::from_text(
+            good,
+            vec![
                 bytes(json!({"schema_version": 1, "upserted": {"d": [["alpha"]]}}))
                     .replace("alpha", "beta"),
             ],
-        };
+        );
         assert!(lexical.visit_documents(|_, _| {}).is_err());
+    }
+
+    /// A committed store on disk: base, `segments` deltas and the manifest
+    /// describing them, as a writer commits it.
+    fn write_store(name: &str, segments: usize) -> (PathBuf, Value) {
+        let dir =
+            std::env::temp_dir().join(format!("lodedb-lexical-held-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("g0.tvlex");
+        fs::write(
+            &base_path,
+            bytes(json!({"schema_version": 1, "documents": {
+                "a": [["alpha", "é"]], "b": [["beta"]], "c": [["gamma"]]
+            }})),
+        )
+        .unwrap();
+        let delta_dir = manifest_path(&base_path).parent().unwrap().to_path_buf();
+        fs::create_dir_all(&delta_dir).unwrap();
+        let mut deltas = Vec::new();
+        for seq in 0..segments {
+            let file_name = format!("{seq:06}.json");
+            let path = delta_dir.join(&file_name);
+            fs::write(
+                &path,
+                bytes(json!({"schema_version": 1, "deleted": ["b"],
+                    "upserted": {format!("d{seq}"): [[format!("delta{seq}")]], "a": [["alpha", format!("v{seq}")]]}})),
+            )
+            .unwrap();
+            deltas.push(json!({"seq": seq, "file_name": file_name,
+                "sha256": sha256_file_hex(&path).unwrap()}));
+        }
+        let manifest = json!({"schema_version": LEXICAL_INDEX_SCHEMA_VERSION,
+            "base": {"sha256": sha256_file_hex(&base_path).unwrap()}, "deltas": deltas});
+        (base_path, manifest)
+    }
+
+    fn visited(lexical: &LexicalBytes) -> BTreeMap<String, TokenLists> {
+        let mut out = BTreeMap::new();
+        lexical
+            .visit_documents(|id, lists| {
+                out.insert(id.to_string(), lists);
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn held_files_retain_no_text_and_parse_like_read_text() {
+        let (base_path, manifest) = write_store("parse", 3);
+        let read = read_bytes(&base_path, Some(&manifest)).unwrap().unwrap();
+        let held = open_held(&base_path, Some(&manifest)).unwrap().unwrap();
+        assert_eq!(read.residency().1, 0);
+        assert_eq!(held.residency(), (0, 4));
+        assert_eq!(held.parse().unwrap(), read.parse().unwrap());
+        assert_eq!(visited(&held), visited(&read));
+        // Parsing twice reads the files twice and agrees; nothing is kept.
+        assert_eq!(held.parse().unwrap(), read.parse().unwrap());
+        assert_eq!(held.residency(), (0, 4));
+        // The hash streamed at open is the whole-file hash the manifest uses.
+        assert_eq!(
+            held.base.held_sha256(),
+            Some(sha256_file_hex(&base_path).unwrap().as_str())
+        );
+        fs::remove_dir_all(base_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn segments_past_the_held_limit_keep_their_text() {
+        let (base_path, manifest) = write_store("limit", 3);
+        let read = read_bytes(&base_path, Some(&manifest)).unwrap().unwrap();
+        // Exactly at the limit every segment is held; one above, the last
+        // segment falls back to text.
+        let at_limit = read_sources(&base_path, Some(&manifest), 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_limit.residency(), (0, 4));
+        let below = read_sources(&base_path, Some(&manifest), 2)
+            .unwrap()
+            .unwrap();
+        let last = manifest_path(&base_path).with_file_name("000002.json");
+        assert_eq!(
+            below.residency(),
+            (fs::metadata(last).unwrap().len() as usize, 3)
+        );
+        assert_eq!(at_limit.parse().unwrap(), read.parse().unwrap());
+        assert_eq!(below.parse().unwrap(), read.parse().unwrap());
+        fs::remove_dir_all(base_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn held_open_keeps_the_manifest_errors() {
+        let (base_path, manifest) = write_store("errors", 2);
+        let message = |manifest: &Value| {
+            open_held(&base_path, Some(manifest))
+                .unwrap_err()
+                .to_string()
+        };
+        let mut swapped = manifest.clone();
+        swapped["deltas"][1]["seq"] = json!(0);
+        assert!(message(&swapped).contains("out-of-order segments"));
+        let mut missing = manifest.clone();
+        missing["deltas"][1]["file_name"] = json!("absent.json");
+        assert!(message(&missing).contains("lexical index segment is missing: absent.json"));
+        let mut checksum = manifest.clone();
+        checksum["deltas"][0]["sha256"] = json!("0".repeat(64));
+        assert!(message(&checksum).contains("lexical index segment failed checksum: 000000.json"));
+        let mut base = manifest.clone();
+        base["base"]["sha256"] = json!("0".repeat(64));
+        assert!(message(&base).contains("lexical index base failed manifest checksum"));
+        fs::remove_dir_all(base_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn held_files_reject_bytes_that_change_after_open_or_are_not_utf8() {
+        let (base_path, manifest) = write_store("tamper", 1);
+        let held = open_held(&base_path, Some(&manifest)).unwrap().unwrap();
+        let original = fs::read(&base_path).unwrap();
+        let tampered = String::from_utf8(original.clone())
+            .unwrap()
+            .replace("gamma", "delta");
+        assert_eq!(tampered.len(), original.len());
+        fs::write(&base_path, &tampered).unwrap();
+        let error = held.parse().unwrap_err();
+        assert_eq!(error.code(), crate::error::CoreErrorCode::CorruptStore);
+        assert!(error.to_string().contains("changed after it was opened"));
+        assert!(held.visit_documents(|_, _| {}).is_err());
+        // Nothing was cached: restoring the bytes makes the same handle work.
+        fs::write(&base_path, &original).unwrap();
+        assert!(held.parse().is_ok());
+
+        // A split multi-byte sequence across reads is fine; invalid UTF-8 is
+        // refused at open, as reading the text was.
+        let mut invalid = original.clone();
+        let at = invalid.iter().position(|byte| *byte == b'g').unwrap();
+        invalid[at] = 0xff;
+        fs::write(&base_path, &invalid).unwrap();
+        let error = open_held(&base_path, None).unwrap_err();
+        assert!(error.to_string().contains("not contain valid UTF-8"));
+        assert!(read_bytes(&base_path, None).is_err());
+        let long = format!("{}é", "x".repeat(64 * 1024 - 1));
+        fs::write(&base_path, &long).unwrap();
+        let held = open_held(&base_path, None).unwrap().unwrap();
+        assert_eq!(held.base.text().unwrap(), long);
+        fs::remove_dir_all(base_path.parent().unwrap()).unwrap();
     }
 }
